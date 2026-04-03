@@ -14,8 +14,8 @@ COPY main.py .
 
 RUN if [ -f cookies.txt ]; then cp cookies.txt /app/cookies.txt; fi
 
-RUN useradd -m appuser && chown -R appuser:appuser /app
-USER appuser
+RUN useradd -m -u 10001 appuser && chown -R appuser:appuser /app
+USER 10001
 
 EXPOSE 5000
 
