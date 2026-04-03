@@ -1,5 +1,0 @@
-services:
-  - type: web
-    name: music-player-api
-    env: docker
-    dockerfilePath: ./Dockerfile
