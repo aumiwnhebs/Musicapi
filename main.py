@@ -25,30 +25,6 @@ USER_AGENTS = [
     'Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Mobile Safari/537.36',
 ]
 
-PLAYER_CLIENT_COMBOS = [
-    None,
-    ['default'],
-    ['web'],
-    ['mweb'],
-    ['android'],
-    ['ios'],
-]
-
-PIPED_INSTANCES = [
-    'https://pipedapi.kavin.rocks',
-    'https://watchapi.whatever.social',
-    'https://pipedapi.tokhmi.xyz',
-    'https://pipedapi.moomoo.me',
-    'https://pipedapi.syncpundit.io',
-    'https://api-piped.mha.fi',
-    'https://piped-api.lunar.icu',
-    'https://pipedapi.in.projectsegfau.lt',
-]
-
-COBALT_INSTANCES = [
-    'https://api.cobalt.tools',
-]
-
 COOKIES_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'cookies.txt')
 
 yt_dlp_version = "unknown"
@@ -95,7 +71,7 @@ else:
 update_ytdlp()
 
 
-def _get_ydl_opts(player_combo='USE_DEFAULT'):
+def _base_opts():
     opts = {
         'quiet': True,
         'no_warnings': True,
@@ -119,190 +95,96 @@ def _get_ydl_opts(player_combo='USE_DEFAULT'):
     }
     if os.path.exists(COOKIES_FILE):
         opts['cookiefile'] = COOKIES_FILE
-    if player_combo is not None and player_combo != 'USE_DEFAULT':
-        opts['extractor_args'] = {'youtube': {'player_client': player_combo}}
     return opts
 
 
-def _download_via_piped(video_id, session_dir):
-    for instance in PIPED_INSTANCES:
+def _get_download_strategies(session_dir):
+    strategies = []
+
+    strategies.append({
+        'name': 'default_bestaudio',
+        'opts': {
+            'format': 'bestaudio/best',
+            'postprocessors': [
+                {'key': 'FFmpegExtractAudio', 'preferredcodec': 'mp3', 'preferredquality': '192'},
+                {'key': 'EmbedThumbnail'},
+                {'key': 'FFmpegMetadata'},
+            ],
+            'writethumbnail': True,
+            'outtmpl': os.path.join(session_dir, '%(title)s.%(ext)s'),
+        }
+    })
+
+    strategies.append({
+        'name': 'noformat_extract',
+        'opts': {
+            'postprocessors': [
+                {'key': 'FFmpegExtractAudio', 'preferredcodec': 'mp3', 'preferredquality': '192'},
+            ],
+            'outtmpl': os.path.join(session_dir, '%(title)s.%(ext)s'),
+        }
+    })
+
+    strategies.append({
+        'name': 'any_format_raw',
+        'opts': {
+            'format': 'worstaudio/worst/bestaudio/best',
+            'postprocessors': [
+                {'key': 'FFmpegExtractAudio', 'preferredcodec': 'mp3', 'preferredquality': '128'},
+            ],
+            'outtmpl': os.path.join(session_dir, '%(title)s.%(ext)s'),
+        }
+    })
+
+    strategies.append({
+        'name': 'direct_download',
+        'opts': {
+            'format': 'best',
+            'outtmpl': os.path.join(session_dir, '%(title)s.%(ext)s'),
+        }
+    })
+
+    return strategies
+
+
+def _list_formats(video_id):
+    try:
+        opts = _base_opts()
+        opts['skip_download'] = True
+        opts['quiet'] = True
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(f"https://www.youtube.com/watch?v={video_id}", download=False)
+            formats = info.get('formats', [])
+            format_summary = []
+            for f in formats:
+                fid = f.get('format_id', '?')
+                ext = f.get('ext', '?')
+                acodec = f.get('acodec', 'none')
+                vcodec = f.get('vcodec', 'none')
+                abr = f.get('abr', 0)
+                format_summary.append(f"id={fid} ext={ext} a={acodec} v={vcodec} abr={abr}")
+            return formats, format_summary
+    except Exception as e:
+        logger.warning(f"Format listing failed: {str(e)[:100]}")
+        return [], []
+
+
+def _convert_to_mp3(session_dir):
+    all_files = globmod.glob(os.path.join(session_dir, '*'))
+    non_mp3 = [f for f in all_files if not f.endswith('.mp3') and not f.endswith('.part') and not f.endswith('.jpg') and not f.endswith('.png') and not f.endswith('.webp')]
+    for raw_path in non_mp3:
+        mp3_path = os.path.splitext(raw_path)[0] + '.mp3'
         try:
-            logger.info(f"Trying Piped instance: {instance}")
-            resp = req_lib.get(
-                f"{instance}/streams/{video_id}",
-                timeout=15,
-                headers={'User-Agent': random.choice(USER_AGENTS)}
+            result = subprocess.run(
+                ['ffmpeg', '-i', raw_path, '-vn', '-ab', '192k', '-ar', '44100', '-y', mp3_path],
+                capture_output=True, text=True, timeout=120
             )
-            if resp.status_code != 200:
-                logger.warning(f"Piped {instance} returned {resp.status_code}")
-                continue
-
-            data = resp.json()
-            audio_streams = data.get('audioStreams', [])
-            if not audio_streams:
-                logger.warning(f"Piped {instance}: no audio streams")
-                continue
-
-            audio_streams.sort(key=lambda x: x.get('bitrate', 0), reverse=True)
-
-            best_stream = None
-            for stream in audio_streams:
-                mime = stream.get('mimeType', '')
-                if 'audio' in mime:
-                    best_stream = stream
-                    break
-            if not best_stream:
-                best_stream = audio_streams[0]
-
-            stream_url = best_stream.get('url', '')
-            if not stream_url:
-                continue
-
-            title = data.get('title', video_id)
-            title = re.sub(r'[<>:"/\\|?*]', '', title).strip() or video_id
-
-            ext = 'm4a'
-            mime = best_stream.get('mimeType', '')
-            if 'webm' in mime or 'opus' in mime:
-                ext = 'webm'
-            elif 'mp4' in mime or 'm4a' in mime:
-                ext = 'm4a'
-
-            raw_path = os.path.join(session_dir, f"{title}.{ext}")
-            mp3_path = os.path.join(session_dir, f"{title}.mp3")
-
-            logger.info(f"Downloading from Piped: bitrate={best_stream.get('bitrate')}, mime={mime}")
-            audio_resp = req_lib.get(stream_url, stream=True, timeout=60,
-                                     headers={'User-Agent': random.choice(USER_AGENTS)})
-            if audio_resp.status_code != 200:
-                logger.warning(f"Piped stream download failed: {audio_resp.status_code}")
-                continue
-
-            with open(raw_path, 'wb') as f:
-                for chunk in audio_resp.iter_content(chunk_size=262144):
-                    if chunk:
-                        f.write(chunk)
-
-            if os.path.getsize(raw_path) < 10000:
-                logger.warning("Piped download too small, skipping")
+            if result.returncode == 0 and os.path.exists(mp3_path) and os.path.getsize(mp3_path) > 10000:
                 os.remove(raw_path)
-                continue
-
-            try:
-                ffmpeg_result = subprocess.run(
-                    ['ffmpeg', '-i', raw_path, '-vn', '-ab', '192k',
-                     '-ar', '44100', '-y', mp3_path],
-                    capture_output=True, text=True, timeout=120
-                )
-                if ffmpeg_result.returncode == 0 and os.path.exists(mp3_path):
-                    os.remove(raw_path)
-                    logger.info(f"Piped download + convert success: {title}")
-                    return True
-                else:
-                    logger.warning("FFmpeg convert failed, using raw file")
-                    return True
-            except Exception as e:
-                logger.warning(f"FFmpeg error: {e}, using raw file")
+                logger.info(f"Converted {os.path.basename(raw_path)} to MP3")
                 return True
-
         except Exception as e:
-            logger.warning(f"Piped {instance} failed: {str(e)[:100]}")
-            continue
-
-    return False
-
-
-def _download_via_cobalt(video_id, session_dir):
-    for instance in COBALT_INSTANCES:
-        try:
-            logger.info(f"Trying Cobalt instance: {instance}")
-            resp = req_lib.post(
-                f"{instance}/",
-                json={
-                    'url': f'https://www.youtube.com/watch?v={video_id}',
-                    'audioFormat': 'mp3',
-                    'isAudioOnly': True,
-                    'filenameStyle': 'pretty',
-                },
-                headers={
-                    'Accept': 'application/json',
-                    'Content-Type': 'application/json',
-                    'User-Agent': random.choice(USER_AGENTS),
-                },
-                timeout=30
-            )
-
-            if resp.status_code != 200:
-                logger.warning(f"Cobalt {instance} returned {resp.status_code}: {resp.text[:200]}")
-                continue
-
-            data = resp.json()
-            status = data.get('status', '')
-
-            download_url = None
-            if status in ('redirect', 'stream', 'tunnel'):
-                download_url = data.get('url', '')
-            elif status == 'picker':
-                items = data.get('picker', []) or data.get('audio', [])
-                if items:
-                    download_url = items[0].get('url', '')
-
-            if not download_url:
-                logger.warning(f"Cobalt no download URL, status={status}, data={str(data)[:200]}")
-                continue
-
-            logger.info("Cobalt got URL, downloading...")
-            audio_resp = req_lib.get(download_url, stream=True, timeout=120,
-                                     headers={'User-Agent': random.choice(USER_AGENTS)})
-            if audio_resp.status_code != 200:
-                logger.warning(f"Cobalt download failed: {audio_resp.status_code}")
-                continue
-
-            content_type = audio_resp.headers.get('Content-Type', '')
-            ext = 'mp3'
-            if 'webm' in content_type or 'opus' in content_type:
-                ext = 'webm'
-            elif 'mp4' in content_type or 'm4a' in content_type:
-                ext = 'm4a'
-
-            raw_path = os.path.join(session_dir, f"cobalt_{video_id}.{ext}")
-            mp3_path = os.path.join(session_dir, f"cobalt_{video_id}.mp3")
-
-            with open(raw_path, 'wb') as f:
-                for chunk in audio_resp.iter_content(chunk_size=262144):
-                    if chunk:
-                        f.write(chunk)
-
-            if os.path.getsize(raw_path) < 10000:
-                logger.warning("Cobalt download too small")
-                os.remove(raw_path)
-                continue
-
-            if ext != 'mp3':
-                try:
-                    ffmpeg_result = subprocess.run(
-                        ['ffmpeg', '-i', raw_path, '-vn', '-ab', '192k',
-                         '-ar', '44100', '-y', mp3_path],
-                        capture_output=True, text=True, timeout=120
-                    )
-                    if ffmpeg_result.returncode == 0 and os.path.exists(mp3_path):
-                        os.remove(raw_path)
-                        logger.info("Cobalt download + convert success")
-                        return True
-                    else:
-                        logger.warning("Cobalt FFmpeg failed, using raw file")
-                        return True
-                except Exception as e:
-                    logger.warning(f"Cobalt FFmpeg error: {e}")
-                    return True
-            else:
-                logger.info("Cobalt download success (already mp3)")
-                return True
-
-        except Exception as e:
-            logger.warning(f"Cobalt {instance} failed: {str(e)[:100]}")
-            continue
-
+            logger.warning(f"FFmpeg convert error: {e}")
     return False
 
 
@@ -365,8 +247,9 @@ def home():
                 <p><code>GET /api/download?v=VIDEO_ID</code> - Download MP3</p>
                 <p><code>GET /api/update-ytdlp</code> - Force update yt-dlp</p>
                 <p><code>GET /api/version</code> - Check yt-dlp version</p>
+                <p><code>GET /api/formats?v=VIDEO_ID</code> - List available formats</p>
             </div>
-            <p class="version">yt-dlp: {ver} | Cookies: {cookies_status} | Cobalt + Piped fallback</p>
+            <p class="version">yt-dlp: {ver} | Cookies: {cookies_status}</p>
         </div>
     </body>
     </html>
@@ -383,9 +266,6 @@ def version():
     return jsonify({
         'ytdlp_version': get_ytdlp_version(),
         'cookies_loaded': os.path.exists(COOKIES_FILE),
-        'piped_instances': len(PIPED_INSTANCES),
-        'cobalt_instances': len(COBALT_INSTANCES),
-        'player_clients': [str(c) for c in PLAYER_CLIENT_COMBOS]
     })
 
 
@@ -399,6 +279,21 @@ def force_update():
         'old_version': old_ver,
         'new_version': new_ver,
         'message': f'Updated from {old_ver} to {new_ver}' if success else 'Update failed'
+    })
+
+
+@app.route('/api/formats')
+def formats():
+    video_id = flask_request.args.get('v', '').strip()
+    if not video_id or not re.match(r'^[A-Za-z0-9_-]{1,20}$', video_id):
+        return jsonify({'error': 'Invalid video ID'}), 400
+    fmts, summary = _list_formats(video_id)
+    return jsonify({
+        'video_id': video_id,
+        'format_count': len(fmts),
+        'formats': summary[:30],
+        'has_audio': any(f.get('acodec', 'none') != 'none' for f in fmts),
+        'has_video': any(f.get('vcodec', 'none') != 'none' for f in fmts),
     })
 
 
@@ -416,71 +311,98 @@ def download():
     method_used = None
 
     try:
-        for combo in PLAYER_CLIENT_COMBOS:
-            try:
-                combo_name = str(combo) if combo else "default(no-override)"
-                logger.info(f"Trying client {combo_name} for {video_id}")
-                opts = _get_ydl_opts(combo)
-                opts.update({
-                    'format': 'bestaudio/best',
-                    'writethumbnail': True,
-                    'postprocessors': [
-                        {
-                            'key': 'FFmpegExtractAudio',
-                            'preferredcodec': 'mp3',
-                            'preferredquality': '192',
-                        },
-                        {
-                            'key': 'EmbedThumbnail',
-                        },
-                        {
-                            'key': 'FFmpegMetadata',
-                        },
-                    ],
-                    'outtmpl': os.path.join(session_dir, '%(title)s.%(ext)s'),
+        logger.info(f"=== Download request for {video_id} ===")
+
+        fmts, fmt_summary = _list_formats(video_id)
+        if fmts:
+            logger.info(f"Found {len(fmts)} formats. Audio formats: {sum(1 for f in fmts if f.get('acodec', 'none') != 'none')}")
+            audio_fmts = [f for f in fmts if f.get('acodec', 'none') != 'none']
+            if audio_fmts:
+                audio_fmts.sort(key=lambda x: x.get('abr', 0) or 0, reverse=True)
+                best = audio_fmts[0]
+                logger.info(f"Best audio: id={best.get('format_id')} ext={best.get('ext')} abr={best.get('abr')} acodec={best.get('acodec')}")
+        else:
+            logger.warning(f"No formats found for {video_id}")
+
+        strategies = _get_download_strategies(session_dir)
+
+        if fmts:
+            audio_fmts = [f for f in fmts if f.get('acodec', 'none') != 'none']
+            if audio_fmts:
+                audio_fmts.sort(key=lambda x: x.get('abr', 0) or 0, reverse=True)
+                best_id = audio_fmts[0].get('format_id')
+                strategies.insert(1, {
+                    'name': f'specific_format_{best_id}',
+                    'opts': {
+                        'format': best_id,
+                        'postprocessors': [
+                            {'key': 'FFmpegExtractAudio', 'preferredcodec': 'mp3', 'preferredquality': '192'},
+                        ],
+                        'outtmpl': os.path.join(session_dir, '%(title)s.%(ext)s'),
+                    }
                 })
+
+            all_with_audio = [f for f in fmts if f.get('acodec', 'none') != 'none']
+            if all_with_audio:
+                format_ids = '/'.join(f.get('format_id', '') for f in all_with_audio[:5])
+                strategies.insert(2, {
+                    'name': 'multi_format_try',
+                    'opts': {
+                        'format': format_ids,
+                        'postprocessors': [
+                            {'key': 'FFmpegExtractAudio', 'preferredcodec': 'mp3', 'preferredquality': '192'},
+                        ],
+                        'outtmpl': os.path.join(session_dir, '%(title)s.%(ext)s'),
+                    }
+                })
+
+        for strategy in strategies:
+            mp3_check = globmod.glob(os.path.join(session_dir, '*.mp3'))
+            if mp3_check:
+                break
+
+            try:
+                name = strategy['name']
+                logger.info(f"Trying strategy: {name}")
+                opts = _base_opts()
+                opts.update(strategy['opts'])
 
                 with yt_dlp.YoutubeDL(opts) as ydl:
                     ydl.extract_info(f"https://www.youtube.com/watch?v={video_id}", download=True)
 
                 mp3_check = globmod.glob(os.path.join(session_dir, '*.mp3'))
                 if mp3_check:
-                    logger.info(f"yt-dlp success with client {combo_name}")
-                    method_used = f"yt-dlp ({combo_name})"
+                    logger.info(f"Strategy {name} succeeded!")
+                    method_used = name
                     break
+
+                all_files = globmod.glob(os.path.join(session_dir, '*'))
+                if all_files:
+                    logger.info(f"Strategy {name} downloaded files but no mp3, converting...")
+                    if _convert_to_mp3(session_dir):
+                        method_used = f"{name}+ffmpeg"
+                        break
+
             except Exception as e:
                 error_msg = str(e)
-                combo_name = str(combo) if combo else "default(no-override)"
-                errors_log.append(f"{combo_name}: {error_msg[:100]}")
-                logger.warning(f"Client {combo_name} failed: {error_msg[:150]}")
-                error_lower = error_msg.lower()
-                if any(k in error_lower for k in ['403', 'forbidden', 'sign in', 'bot', 'confirm', 'format']):
-                    time.sleep(0.5)
-                    continue
+                errors_log.append(f"{strategy['name']}: {error_msg[:120]}")
+                logger.warning(f"Strategy {strategy['name']} failed: {error_msg[:200]}")
+                time.sleep(0.3)
                 continue
-
-        found_files = globmod.glob(os.path.join(session_dir, '*.mp3'))
-        if not found_files:
-            logger.info(f"yt-dlp failed for {video_id}, trying Cobalt API...")
-            cobalt_success = _download_via_cobalt(video_id, session_dir)
-            if cobalt_success:
-                method_used = "cobalt"
-
-        found_files = globmod.glob(os.path.join(session_dir, '*.mp3'))
-        all_existing = globmod.glob(os.path.join(session_dir, '*'))
-        if not found_files and not all_existing:
-            logger.info(f"Cobalt failed for {video_id}, trying Piped API...")
-            piped_success = _download_via_piped(video_id, session_dir)
-            if piped_success:
-                method_used = "piped"
 
         mp3_files = globmod.glob(os.path.join(session_dir, '*.mp3'))
         if not mp3_files:
             all_files = globmod.glob(os.path.join(session_dir, '*'))
-            audio_exts = ['.m4a', '.webm', '.opus', '.ogg', '.wav']
-            mp3_files = [f for f in all_files if any(f.lower().endswith(ext) for ext in audio_exts)]
-            if not mp3_files and all_files:
-                mp3_files = all_files
+            all_files = [f for f in all_files if not f.endswith('.part') and not f.endswith('.jpg') and not f.endswith('.png') and not f.endswith('.webp')]
+            if all_files:
+                _convert_to_mp3(session_dir)
+                mp3_files = globmod.glob(os.path.join(session_dir, '*.mp3'))
+
+            if not mp3_files:
+                audio_exts = ['.m4a', '.webm', '.opus', '.ogg', '.wav', '.mp4', '.mkv']
+                mp3_files = [f for f in all_files if any(f.lower().endswith(ext) for ext in audio_exts)]
+                if not mp3_files and all_files:
+                    mp3_files = all_files
 
         if mp3_files:
             filepath = mp3_files[0]
@@ -510,9 +432,9 @@ def download():
             )
         else:
             _cleanup_dir(session_dir)
-            logger.error(f"All methods failed for {video_id}: {errors_log}")
+            logger.error(f"All strategies failed for {video_id}: {errors_log}")
             return jsonify({
-                'error': 'Download failed - all methods failed',
+                'error': 'Download failed',
                 'details': errors_log[-3:] if errors_log else [],
                 'ytdlp_version': get_ytdlp_version()
             }), 500
@@ -527,5 +449,4 @@ if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
     logger.info(f"Music Player API Server starting on port {port}...")
     logger.info(f"yt-dlp version: {get_ytdlp_version()}")
-    logger.info(f"Cobalt + Piped fallback enabled")
     app.run(host='0.0.0.0', port=port, debug=False, threaded=True)
