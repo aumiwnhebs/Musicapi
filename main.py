@@ -425,7 +425,7 @@ def download():
                 logger.info(f"Trying client {combo} for {video_id}")
                 opts = _get_ydl_opts(combo)
                 opts.update({
-                    'format': 'bestaudio[ext=m4a]/bestaudio[acodec=mp4a]/bestaudio/best',
+                    'format': 'bestaudio/best',
                     'writethumbnail': True,
                     'postprocessors': [
                         {
