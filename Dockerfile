@@ -9,6 +9,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 RUN pip install --no-cache-dir --upgrade --force-reinstall yt-dlp
 
 COPY main.py .
+COPY cookies.txt* ./
 
 EXPOSE 5000
 

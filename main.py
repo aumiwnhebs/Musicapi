@@ -37,33 +37,37 @@ PLAYER_CLIENT_COMBOS = [
 
 PIPED_INSTANCES = [
     'https://pipedapi.kavin.rocks',
-    'https://pipedapi.adminforge.de',
-    'https://api.piped.yt',
-    'https://pipedapi.r4fo.com',
-    'https://pipedapi.leptons.xyz',
+    'https://watchapi.whatever.social',
+    'https://pipedapi.tokhmi.xyz',
+    'https://pipedapi.moomoo.me',
+    'https://pipedapi.syncpundit.io',
+    'https://api-piped.mha.fi',
+    'https://piped-api.lunar.icu',
+    'https://pipedapi.in.projectsegfau.lt',
+]
+
+COBALT_INSTANCES = [
+    'https://api.cobalt.tools',
 ]
 
 COOKIES_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'cookies.txt')
 
 yt_dlp_version = "unknown"
-last_update_check = 0
-UPDATE_INTERVAL = 3600
 
 
 def update_ytdlp():
-    global yt_dlp_version, last_update_check
+    global yt_dlp_version
     try:
-        logger.info("Updating yt-dlp to latest version...")
+        logger.info("Checking yt-dlp for updates...")
         result = subprocess.run(
-            ['pip', 'install', '--upgrade', '--force-reinstall', 'yt-dlp'],
+            ['pip', 'install', '--upgrade', 'yt-dlp'],
             capture_output=True, text=True, timeout=120
         )
         if result.returncode == 0:
             import importlib
             importlib.reload(yt_dlp)
             yt_dlp_version = yt_dlp.version.__version__
-            last_update_check = time.time()
-            logger.info(f"yt-dlp updated to {yt_dlp_version}")
+            logger.info(f"yt-dlp is at latest version: {yt_dlp_version}")
             return True
         else:
             logger.error(f"yt-dlp update failed: {result.stderr}")
@@ -73,13 +77,6 @@ def update_ytdlp():
         return False
 
 
-def check_and_update_ytdlp():
-    global last_update_check
-    now = time.time()
-    if now - last_update_check > UPDATE_INTERVAL:
-        update_ytdlp()
-
-
 def get_ytdlp_version():
     try:
         return yt_dlp.version.__version__
@@ -87,11 +84,14 @@ def get_ytdlp_version():
         return "unknown"
 
 
-try:
-    yt_dlp_version = get_ytdlp_version()
-    logger.info(f"yt-dlp version on start: {yt_dlp_version}")
-except:
-    pass
+yt_dlp_version = get_ytdlp_version()
+logger.info(f"yt-dlp version on start: {yt_dlp_version}")
+
+if os.path.exists(COOKIES_FILE):
+    cookie_size = os.path.getsize(COOKIES_FILE)
+    logger.info(f"Cookies file found: {COOKIES_FILE} ({cookie_size} bytes)")
+else:
+    logger.info(f"No cookies file at {COOKIES_FILE}")
 
 update_ytdlp()
 
@@ -215,6 +215,99 @@ def _download_via_piped(video_id, session_dir):
     return False
 
 
+def _download_via_cobalt(video_id, session_dir):
+    for instance in COBALT_INSTANCES:
+        try:
+            logger.info(f"Trying Cobalt instance: {instance}")
+            resp = req_lib.post(
+                f"{instance}/",
+                json={
+                    'url': f'https://www.youtube.com/watch?v={video_id}',
+                    'audioFormat': 'mp3',
+                    'isAudioOnly': True,
+                    'filenameStyle': 'pretty',
+                },
+                headers={
+                    'Accept': 'application/json',
+                    'Content-Type': 'application/json',
+                    'User-Agent': random.choice(USER_AGENTS),
+                },
+                timeout=30
+            )
+
+            if resp.status_code != 200:
+                logger.warning(f"Cobalt {instance} returned {resp.status_code}: {resp.text[:200]}")
+                continue
+
+            data = resp.json()
+            status = data.get('status', '')
+
+            download_url = None
+            if status == 'redirect' or status == 'stream':
+                download_url = data.get('url', '')
+            elif status == 'tunnel':
+                download_url = data.get('url', '')
+            elif status == 'picker':
+                items = data.get('picker', []) or data.get('audio', [])
+                if items:
+                    download_url = items[0].get('url', '')
+
+            if not download_url:
+                logger.warning(f"Cobalt no download URL, status={status}, data={str(data)[:200]}")
+                continue
+
+            logger.info(f"Cobalt got URL, downloading...")
+            audio_resp = req_lib.get(download_url, stream=True, timeout=120,
+                                     headers={'User-Agent': random.choice(USER_AGENTS)})
+            if audio_resp.status_code != 200:
+                logger.warning(f"Cobalt download failed: {audio_resp.status_code}")
+                continue
+
+            content_type = audio_resp.headers.get('Content-Type', '')
+            ext = 'mp3'
+            if 'webm' in content_type or 'opus' in content_type:
+                ext = 'webm'
+            elif 'mp4' in content_type or 'm4a' in content_type:
+                ext = 'm4a'
+
+            raw_path = os.path.join(session_dir, f"cobalt_{video_id}.{ext}")
+            mp3_path = os.path.join(session_dir, f"cobalt_{video_id}.mp3")
+
+            with open(raw_path, 'wb') as f:
+                for chunk in audio_resp.iter_content(chunk_size=262144):
+                    if chunk:
+                        f.write(chunk)
+
+            if os.path.getsize(raw_path) < 10000:
+                logger.warning("Cobalt download too small")
+                os.remove(raw_path)
+                continue
+
+            if ext != 'mp3':
+                try:
+                    ffmpeg_result = subprocess.run(
+                        ['ffmpeg', '-i', raw_path, '-vn', '-ab', '192k',
+                         '-ar', '44100', '-y', mp3_path],
+                        capture_output=True, text=True, timeout=120
+                    )
+                    if ffmpeg_result.returncode == 0 and os.path.exists(mp3_path):
+                        os.remove(raw_path)
+                        logger.info(f"Cobalt download + convert success")
+                        return True
+                except Exception as e:
+                    logger.warning(f"Cobalt FFmpeg error: {e}")
+                    return True
+            else:
+                logger.info("Cobalt download success (already mp3)")
+                return True
+
+        except Exception as e:
+            logger.warning(f"Cobalt {instance} failed: {str(e)[:100]}")
+            continue
+
+    return False
+
+
 def _cleanup_dir(dirpath):
     try:
         for f in os.listdir(dirpath):
@@ -240,20 +333,8 @@ def _self_ping():
         time.sleep(600)
 
 
-def _auto_update_loop():
-    while True:
-        time.sleep(UPDATE_INTERVAL)
-        try:
-            update_ytdlp()
-        except:
-            pass
-
-
 ping_thread = threading.Thread(target=_self_ping, daemon=True)
 ping_thread.start()
-
-update_thread = threading.Thread(target=_auto_update_loop, daemon=True)
-update_thread.start()
 
 
 @app.route('/')
@@ -286,7 +367,7 @@ def home():
                 <p><code>GET /api/update-ytdlp</code> - Force update yt-dlp</p>
                 <p><code>GET /api/version</code> - Check yt-dlp version</p>
             </div>
-            <p class="version">yt-dlp: {ver} | Piped fallback: enabled | Auto-update: every 1 hour</p>
+            <p class="version">yt-dlp: {ver} | Cobalt + Piped fallback | Auto-update: every 1 hour</p>
         </div>
     </body>
     </html>
@@ -335,8 +416,6 @@ def download():
     session_dir = os.path.join(DOWNLOAD_FOLDER, session_id)
     os.makedirs(session_dir, exist_ok=True)
 
-    check_and_update_ytdlp()
-
     errors_log = []
     method_used = None
 
@@ -384,10 +463,19 @@ def download():
 
         found_files = globmod.glob(os.path.join(session_dir, '*.mp3'))
         if not found_files:
-            logger.info(f"yt-dlp failed for {video_id}, trying Piped API fallback...")
-            piped_success = _download_via_piped(video_id, session_dir)
-            if piped_success:
-                method_used = "piped"
+            logger.info(f"yt-dlp failed for {video_id}, trying Cobalt API fallback...")
+            cobalt_success = _download_via_cobalt(video_id, session_dir)
+            if cobalt_success:
+                method_used = "cobalt"
+
+        found_files = globmod.glob(os.path.join(session_dir, '*.mp3'))
+        if not found_files:
+            all_f = globmod.glob(os.path.join(session_dir, '*'))
+            if not all_f:
+                logger.info(f"Cobalt failed for {video_id}, trying Piped API fallback...")
+                piped_success = _download_via_piped(video_id, session_dir)
+                if piped_success:
+                    method_used = "piped"
 
         mp3_files = globmod.glob(os.path.join(session_dir, '*.mp3'))
         if not mp3_files:
