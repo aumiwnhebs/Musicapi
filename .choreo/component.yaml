@@ -8,4 +8,4 @@ endpoints:
       type: REST
       networkVisibilities:
         - Public
-
+      authType: none
