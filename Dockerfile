@@ -1,6 +1,6 @@
 FROM python:3.11-slim
 
-RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y ffmpeg && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
@@ -9,8 +9,6 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY main.py .
 
-RUN mkdir -p api_downloads stream_cache
+EXPOSE 5000
 
-EXPOSE 10000
-
-CMD gunicorn main:app --bind 0.0.0.0:${PORT:-10000} --workers 2 --threads 4 --timeout 120
+CMD gunicorn --bind 0.0.0.0:${PORT:-5000} --workers 2 --timeout 120 --threads 4 main:app
