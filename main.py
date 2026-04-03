@@ -26,13 +26,12 @@ USER_AGENTS = [
 ]
 
 PLAYER_CLIENT_COMBOS = [
-    ['tv'],
-    ['tv_embedded'],
-    ['mediaconnect'],
-    ['web_creator'],
-    ['android_vr'],
-    ['android_creator'],
-    ['ios_creator'],
+    None,
+    ['default'],
+    ['web'],
+    ['mweb'],
+    ['android'],
+    ['ios'],
 ]
 
 PIPED_INSTANCES = [
@@ -96,9 +95,7 @@ else:
 update_ytdlp()
 
 
-def _get_ydl_opts(player_combo=None):
-    if player_combo is None:
-        player_combo = PLAYER_CLIENT_COMBOS[0]
+def _get_ydl_opts(player_combo='USE_DEFAULT'):
     opts = {
         'quiet': True,
         'no_warnings': True,
@@ -122,7 +119,7 @@ def _get_ydl_opts(player_combo=None):
     }
     if os.path.exists(COOKIES_FILE):
         opts['cookiefile'] = COOKIES_FILE
-    if player_combo:
+    if player_combo is not None and player_combo != 'USE_DEFAULT':
         opts['extractor_args'] = {'youtube': {'player_client': player_combo}}
     return opts
 
@@ -202,7 +199,7 @@ def _download_via_piped(video_id, session_dir):
                     logger.info(f"Piped download + convert success: {title}")
                     return True
                 else:
-                    logger.warning(f"FFmpeg convert failed, using raw file")
+                    logger.warning("FFmpeg convert failed, using raw file")
                     return True
             except Exception as e:
                 logger.warning(f"FFmpeg error: {e}, using raw file")
@@ -243,9 +240,7 @@ def _download_via_cobalt(video_id, session_dir):
             status = data.get('status', '')
 
             download_url = None
-            if status == 'redirect' or status == 'stream':
-                download_url = data.get('url', '')
-            elif status == 'tunnel':
+            if status in ('redirect', 'stream', 'tunnel'):
                 download_url = data.get('url', '')
             elif status == 'picker':
                 items = data.get('picker', []) or data.get('audio', [])
@@ -256,7 +251,7 @@ def _download_via_cobalt(video_id, session_dir):
                 logger.warning(f"Cobalt no download URL, status={status}, data={str(data)[:200]}")
                 continue
 
-            logger.info(f"Cobalt got URL, downloading...")
+            logger.info("Cobalt got URL, downloading...")
             audio_resp = req_lib.get(download_url, stream=True, timeout=120,
                                      headers={'User-Agent': random.choice(USER_AGENTS)})
             if audio_resp.status_code != 200:
@@ -292,7 +287,10 @@ def _download_via_cobalt(video_id, session_dir):
                     )
                     if ffmpeg_result.returncode == 0 and os.path.exists(mp3_path):
                         os.remove(raw_path)
-                        logger.info(f"Cobalt download + convert success")
+                        logger.info("Cobalt download + convert success")
+                        return True
+                    else:
+                        logger.warning("Cobalt FFmpeg failed, using raw file")
                         return True
                 except Exception as e:
                     logger.warning(f"Cobalt FFmpeg error: {e}")
@@ -340,6 +338,7 @@ ping_thread.start()
 @app.route('/')
 def home():
     ver = get_ytdlp_version()
+    cookies_status = "loaded" if os.path.exists(COOKIES_FILE) else "not found"
     return f'''
     <html>
     <head>
@@ -367,7 +366,7 @@ def home():
                 <p><code>GET /api/update-ytdlp</code> - Force update yt-dlp</p>
                 <p><code>GET /api/version</code> - Check yt-dlp version</p>
             </div>
-            <p class="version">yt-dlp: {ver} | Cobalt + Piped fallback | Auto-update: every 1 hour</p>
+            <p class="version">yt-dlp: {ver} | Cookies: {cookies_status} | Cobalt + Piped fallback</p>
         </div>
     </body>
     </html>
@@ -383,11 +382,10 @@ def health():
 def version():
     return jsonify({
         'ytdlp_version': get_ytdlp_version(),
-        'last_update': time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(last_update_check)),
         'cookies_loaded': os.path.exists(COOKIES_FILE),
-        'piped_fallback': True,
         'piped_instances': len(PIPED_INSTANCES),
-        'player_clients': PLAYER_CLIENT_COMBOS
+        'cobalt_instances': len(COBALT_INSTANCES),
+        'player_clients': [str(c) for c in PLAYER_CLIENT_COMBOS]
     })
 
 
@@ -410,8 +408,6 @@ def download():
     if not video_id or not re.match(r'^[A-Za-z0-9_-]{1,20}$', video_id):
         return jsonify({'error': 'Invalid video ID'}), 400
 
-    req_title = flask_request.args.get('title', '').strip()
-
     session_id = uuid.uuid4().hex[:8]
     session_dir = os.path.join(DOWNLOAD_FOLDER, session_id)
     os.makedirs(session_dir, exist_ok=True)
@@ -422,7 +418,8 @@ def download():
     try:
         for combo in PLAYER_CLIENT_COMBOS:
             try:
-                logger.info(f"Trying client {combo} for {video_id}")
+                combo_name = str(combo) if combo else "default(no-override)"
+                logger.info(f"Trying client {combo_name} for {video_id}")
                 opts = _get_ydl_opts(combo)
                 opts.update({
                     'format': 'bestaudio/best',
@@ -448,34 +445,34 @@ def download():
 
                 mp3_check = globmod.glob(os.path.join(session_dir, '*.mp3'))
                 if mp3_check:
-                    logger.info(f"yt-dlp success with client {combo}")
-                    method_used = f"yt-dlp ({combo[0]})"
+                    logger.info(f"yt-dlp success with client {combo_name}")
+                    method_used = f"yt-dlp ({combo_name})"
                     break
             except Exception as e:
                 error_msg = str(e)
-                errors_log.append(f"{combo}: {error_msg[:100]}")
-                logger.warning(f"Client {combo} failed: {error_msg[:150]}")
+                combo_name = str(combo) if combo else "default(no-override)"
+                errors_log.append(f"{combo_name}: {error_msg[:100]}")
+                logger.warning(f"Client {combo_name} failed: {error_msg[:150]}")
                 error_lower = error_msg.lower()
-                if any(k in error_lower for k in ['403', 'forbidden', 'sign in', 'bot', 'confirm']):
+                if any(k in error_lower for k in ['403', 'forbidden', 'sign in', 'bot', 'confirm', 'format']):
                     time.sleep(0.5)
                     continue
                 continue
 
         found_files = globmod.glob(os.path.join(session_dir, '*.mp3'))
         if not found_files:
-            logger.info(f"yt-dlp failed for {video_id}, trying Cobalt API fallback...")
+            logger.info(f"yt-dlp failed for {video_id}, trying Cobalt API...")
             cobalt_success = _download_via_cobalt(video_id, session_dir)
             if cobalt_success:
                 method_used = "cobalt"
 
         found_files = globmod.glob(os.path.join(session_dir, '*.mp3'))
-        if not found_files:
-            all_f = globmod.glob(os.path.join(session_dir, '*'))
-            if not all_f:
-                logger.info(f"Cobalt failed for {video_id}, trying Piped API fallback...")
-                piped_success = _download_via_piped(video_id, session_dir)
-                if piped_success:
-                    method_used = "piped"
+        all_existing = globmod.glob(os.path.join(session_dir, '*'))
+        if not found_files and not all_existing:
+            logger.info(f"Cobalt failed for {video_id}, trying Piped API...")
+            piped_success = _download_via_piped(video_id, session_dir)
+            if piped_success:
+                method_used = "piped"
 
         mp3_files = globmod.glob(os.path.join(session_dir, '*.mp3'))
         if not mp3_files:
@@ -517,12 +514,12 @@ def download():
             return jsonify({
                 'error': 'Download failed - all methods failed',
                 'details': errors_log[-3:] if errors_log else [],
-                'ytdlp_version': get_ytdlp_version(),
-                'tip': 'Try /api/update-ytdlp to force update'
+                'ytdlp_version': get_ytdlp_version()
             }), 500
 
     except Exception as e:
         _cleanup_dir(session_dir)
+        logger.error(f"Download exception for {video_id}: {str(e)[:200]}")
         return jsonify({'error': str(e)[:200]}), 500
 
 
@@ -530,5 +527,5 @@ if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
     logger.info(f"Music Player API Server starting on port {port}...")
     logger.info(f"yt-dlp version: {get_ytdlp_version()}")
-    logger.info(f"Piped fallback: {len(PIPED_INSTANCES)} instances configured")
+    logger.info(f"Cobalt + Piped fallback enabled")
     app.run(host='0.0.0.0', port=port, debug=False, threaded=True)
