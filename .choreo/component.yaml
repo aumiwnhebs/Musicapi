@@ -1,9 +1,11 @@
-schemaVersion: 1.0
+schemaVersion: "1.2"
 endpoints:
-  - name: music-api
-    port: 5000
-    type: REST
-    networkVisibility: Public
-    context: /
-    service:
-      port: 5000
+    - name: music-api
+      displayName: music-api
+      service:
+        basePath: /
+        port: 5000
+      type: REST
+      networkVisibilities:
+        - Public
+
