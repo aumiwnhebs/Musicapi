@@ -7,6 +7,7 @@ import glob as globmod
 import threading
 import subprocess
 import logging
+import requests as req_lib
 import yt_dlp
 from flask import Flask, jsonify, request as flask_request, Response
 
@@ -32,6 +33,14 @@ PLAYER_CLIENT_COMBOS = [
     ['android_vr'],
     ['android_creator'],
     ['ios_creator'],
+]
+
+PIPED_INSTANCES = [
+    'https://pipedapi.kavin.rocks',
+    'https://pipedapi.adminforge.de',
+    'https://api.piped.yt',
+    'https://pipedapi.r4fo.com',
+    'https://pipedapi.leptons.xyz',
 ]
 
 COOKIES_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'cookies.txt')
@@ -118,6 +127,94 @@ def _get_ydl_opts(player_combo=None):
     return opts
 
 
+def _download_via_piped(video_id, session_dir):
+    for instance in PIPED_INSTANCES:
+        try:
+            logger.info(f"Trying Piped instance: {instance}")
+            resp = req_lib.get(
+                f"{instance}/streams/{video_id}",
+                timeout=15,
+                headers={'User-Agent': random.choice(USER_AGENTS)}
+            )
+            if resp.status_code != 200:
+                logger.warning(f"Piped {instance} returned {resp.status_code}")
+                continue
+
+            data = resp.json()
+            audio_streams = data.get('audioStreams', [])
+            if not audio_streams:
+                logger.warning(f"Piped {instance}: no audio streams")
+                continue
+
+            audio_streams.sort(key=lambda x: x.get('bitrate', 0), reverse=True)
+
+            best_stream = None
+            for stream in audio_streams:
+                mime = stream.get('mimeType', '')
+                if 'audio' in mime:
+                    best_stream = stream
+                    break
+            if not best_stream:
+                best_stream = audio_streams[0]
+
+            stream_url = best_stream.get('url', '')
+            if not stream_url:
+                continue
+
+            title = data.get('title', video_id)
+            title = re.sub(r'[<>:"/\\|?*]', '', title).strip() or video_id
+
+            ext = 'm4a'
+            mime = best_stream.get('mimeType', '')
+            if 'webm' in mime or 'opus' in mime:
+                ext = 'webm'
+            elif 'mp4' in mime or 'm4a' in mime:
+                ext = 'm4a'
+
+            raw_path = os.path.join(session_dir, f"{title}.{ext}")
+            mp3_path = os.path.join(session_dir, f"{title}.mp3")
+
+            logger.info(f"Downloading from Piped: bitrate={best_stream.get('bitrate')}, mime={mime}")
+            audio_resp = req_lib.get(stream_url, stream=True, timeout=60,
+                                     headers={'User-Agent': random.choice(USER_AGENTS)})
+            if audio_resp.status_code != 200:
+                logger.warning(f"Piped stream download failed: {audio_resp.status_code}")
+                continue
+
+            with open(raw_path, 'wb') as f:
+                for chunk in audio_resp.iter_content(chunk_size=262144):
+                    if chunk:
+                        f.write(chunk)
+
+            if os.path.getsize(raw_path) < 10000:
+                logger.warning("Piped download too small, skipping")
+                os.remove(raw_path)
+                continue
+
+            try:
+                ffmpeg_result = subprocess.run(
+                    ['ffmpeg', '-i', raw_path, '-vn', '-ab', '192k',
+                     '-ar', '44100', '-y', mp3_path],
+                    capture_output=True, text=True, timeout=120
+                )
+                if ffmpeg_result.returncode == 0 and os.path.exists(mp3_path):
+                    os.remove(raw_path)
+                    logger.info(f"Piped download + convert success: {title}")
+                    return True
+                else:
+                    logger.warning(f"FFmpeg convert failed, using raw file")
+                    return True
+            except Exception as e:
+                logger.warning(f"FFmpeg error: {e}, using raw file")
+                return True
+
+        except Exception as e:
+            logger.warning(f"Piped {instance} failed: {str(e)[:100]}")
+            continue
+
+    return False
+
+
 def _cleanup_dir(dirpath):
     try:
         for f in os.listdir(dirpath):
@@ -132,13 +229,12 @@ def _cleanup_dir(dirpath):
 
 
 def _self_ping():
-    import requests
     render_url = os.environ.get('RENDER_EXTERNAL_URL', '')
     if not render_url:
         return
     while True:
         try:
-            requests.get(f"{render_url}/api/health", timeout=10)
+            req_lib.get(f"{render_url}/api/health", timeout=10)
         except:
             pass
         time.sleep(600)
@@ -190,7 +286,7 @@ def home():
                 <p><code>GET /api/update-ytdlp</code> - Force update yt-dlp</p>
                 <p><code>GET /api/version</code> - Check yt-dlp version</p>
             </div>
-            <p class="version">yt-dlp: {ver} | Auto-update: every 1 hour</p>
+            <p class="version">yt-dlp: {ver} | Piped fallback: enabled | Auto-update: every 1 hour</p>
         </div>
     </body>
     </html>
@@ -208,6 +304,8 @@ def version():
         'ytdlp_version': get_ytdlp_version(),
         'last_update': time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(last_update_check)),
         'cookies_loaded': os.path.exists(COOKIES_FILE),
+        'piped_fallback': True,
+        'piped_instances': len(PIPED_INSTANCES),
         'player_clients': PLAYER_CLIENT_COMBOS
     })
 
@@ -240,6 +338,7 @@ def download():
     check_and_update_ytdlp()
 
     errors_log = []
+    method_used = None
 
     try:
         for combo in PLAYER_CLIENT_COMBOS:
@@ -270,7 +369,8 @@ def download():
 
                 mp3_check = globmod.glob(os.path.join(session_dir, '*.mp3'))
                 if mp3_check:
-                    logger.info(f"Success with client {combo}")
+                    logger.info(f"yt-dlp success with client {combo}")
+                    method_used = f"yt-dlp ({combo[0]})"
                     break
             except Exception as e:
                 error_msg = str(e)
@@ -278,9 +378,16 @@ def download():
                 logger.warning(f"Client {combo} failed: {error_msg[:150]}")
                 error_lower = error_msg.lower()
                 if any(k in error_lower for k in ['403', 'forbidden', 'sign in', 'bot', 'confirm']):
-                    time.sleep(1)
+                    time.sleep(0.5)
                     continue
                 continue
+
+        found_files = globmod.glob(os.path.join(session_dir, '*.mp3'))
+        if not found_files:
+            logger.info(f"yt-dlp failed for {video_id}, trying Piped API fallback...")
+            piped_success = _download_via_piped(video_id, session_dir)
+            if piped_success:
+                method_used = "piped"
 
         mp3_files = globmod.glob(os.path.join(session_dir, '*.mp3'))
         if not mp3_files:
@@ -295,6 +402,7 @@ def download():
             filename = os.path.basename(filepath)
             filename = filename.encode('ascii', 'ignore').decode('ascii') or 'download.mp3'
             filesize = os.path.getsize(filepath)
+            logger.info(f"Serving {filename} ({filesize} bytes) via {method_used}")
 
             def generate():
                 try:
@@ -317,9 +425,9 @@ def download():
             )
         else:
             _cleanup_dir(session_dir)
-            logger.error(f"All clients failed for {video_id}: {errors_log}")
+            logger.error(f"All methods failed for {video_id}: {errors_log}")
             return jsonify({
-                'error': 'Download failed - all clients blocked',
+                'error': 'Download failed - all methods failed',
                 'details': errors_log[-3:] if errors_log else [],
                 'ytdlp_version': get_ytdlp_version(),
                 'tip': 'Try /api/update-ytdlp to force update'
@@ -334,4 +442,5 @@ if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
     logger.info(f"Music Player API Server starting on port {port}...")
     logger.info(f"yt-dlp version: {get_ytdlp_version()}")
+    logger.info(f"Piped fallback: {len(PIPED_INSTANCES)} instances configured")
     app.run(host='0.0.0.0', port=port, debug=False, threaded=True)
