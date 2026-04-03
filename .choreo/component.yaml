@@ -5,3 +5,5 @@ endpoints:
     type: REST
     networkVisibility: Public
     context: /
+    service:
+      port: 5000
