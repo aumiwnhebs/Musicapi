@@ -15,7 +15,7 @@ app = Flask(__name__)
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-DOWNLOAD_FOLDER = "api_downloads"
+DOWNLOAD_FOLDER = os.path.join("/tmp", "api_downloads")
 os.makedirs(DOWNLOAD_FOLDER, exist_ok=True)
 
 USER_AGENTS = [
